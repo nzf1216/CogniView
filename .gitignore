@@ -1,0 +1,12 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore virtual environment
+cogniview_env/
+
+# Ignore dataset
+data/
+
+# Ignore VS Code settings
+.vscode/
