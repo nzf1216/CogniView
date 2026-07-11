@@ -24,6 +24,10 @@ Usage:
     python -m src.eye_tracking.record_session --source video_file \
         --path sample.mp4 --label 0 --out out.csv
 
+    # Re-recording an existing file on purpose
+    python -m src.eye_tracking.record_session --source webcam --camera-index 0 \
+        --duration 30 --label 0 --out data/fusion/sessions/trial03.csv --overwrite
+
 Author: CogniView Eye Tracking Module
 """
 
@@ -113,6 +117,13 @@ def record_session(
 
     Returns:
         Number of rows written.
+
+    Note:
+        This function does NOT check for an existing out_path -- that check
+        happens once, early, in main() / _parse_args() so a bad --out fails
+        instantly instead of after the ~10s webcam/model warm-up. Callers
+        using record_session() directly (e.g. tests) are responsible for
+        their own overwrite decisions.
     """
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -196,12 +207,30 @@ def _parse_args() -> argparse.Namespace:
         "--require-detection", action="store_true",
         help="Drop frames where no face was detected instead of recording them.",
     )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Allow overwriting an existing --out file. Without this flag, "
+             "the script refuses to run if --out already exists.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     args = _parse_args()
+
+    # Fail fast: check this BEFORE building the camera / warming up the
+    # webcam and face-landmark model, so a reused --out is rejected in
+    # milliseconds instead of ~10 seconds. This is the overwrite-protection
+    # fix -- it must stay this early in main(), not inside record_session().
+    out_path = Path(args.out)
+    if out_path.exists() and not args.overwrite:
+        logger.error(
+            "Refusing to overwrite existing file: %s (pass --overwrite to replace it)",
+            out_path,
+        )
+        raise SystemExit(1)
+
     camera = _build_camera_from_args(args)
     record_session(
         camera=camera,
