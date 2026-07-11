@@ -46,6 +46,7 @@ logger = logging.getLogger("cogniview.eye_tracking.record_session")
 CSV_COLUMNS = [
     "timestamp_ms",
     "detected",
+    "blink_calibrated",
     "ear",
     "blink_count",
     "blink_rate",
@@ -68,6 +69,7 @@ def _row_from_features(features: EyeTrackingFeatures, label: int) -> dict:
     return {
         "timestamp_ms": features.timestamp_ms,
         "detected": int(features.detected),
+        "blink_calibrated": int(features.blink_calibrated),
         "ear": features.ear,
         "blink_count": features.blink_count,
         "blink_rate": features.blink_rate,

@@ -9,6 +9,16 @@ Single Responsibility:
     false double-counts, and blink duration is validated to reject both
     detection glitches (too short) and prolonged eye closure (too long).
 
+Calibration:
+    Open-eye EAR baseline varies a lot person-to-person and camera-to-camera
+    (eye shape, camera angle/distance, landmark geometry) -- fixed absolute
+    thresholds tuned on one person's face can silently fail to detect real
+    blinks on someone whose baseline sits well above or below that tuning
+    point. BlinkDetector therefore calibrates EAR_LOW/EAR_HIGH from each
+    session's own first `calibration_frames` detected frames (assumed to be
+    open-eyes-baseline) rather than trusting fixed constants by default.
+    Fixed thresholds are still available by passing explicit ear_low/ear_high.
+
 Author: CogniView Eye Tracking Module
 """
 
@@ -28,12 +38,18 @@ logger = logging.getLogger("cogniview.eye_tracking.blink")
 # Tunable constants
 # --------------------------------------------------------------------------- #
 
-# Hysteresis thresholds: EAR must drop below EAR_LOW to start closing,
-# and rise above EAR_HIGH to be considered fully open again.
-# EAR_HIGH > EAR_LOW creates a "dead zone" that prevents jitter-triggered
-# double counts when EAR hovers near a single threshold.
+# Fallback hysteresis thresholds, only used if adaptive calibration can't
+# complete (e.g. face never detected for calibration_frames worth of frames).
+# These were tuned on a lower open-eye EAR baseline (~0.25-0.35) and should
+# NOT be assumed to generalize -- adaptive calibration is the default path.
 EAR_LOW = 0.19
 EAR_HIGH = 0.23
+
+# Adaptive calibration: EAR_LOW/EAR_HIGH are derived as a fraction of the
+# per-session open-eye baseline rather than fixed absolutes.
+DEFAULT_CALIBRATION_FRAMES = 30       # ~1-2s of detected frames, session start
+DEFAULT_LOW_RATIO = 0.75              # baseline * 0.75 => "closing" threshold
+DEFAULT_HIGH_RATIO = 0.85             # baseline * 0.85 => "fully open again"
 
 # Blink duration bounds, in milliseconds, used to distinguish a genuine
 # blink from a detection glitch (too short) or a sustained eye closure /
@@ -126,34 +142,66 @@ class BlinkStats:
 
 class BlinkDetector:
     """
-    Hysteresis-based blink detector.
+    Hysteresis-based blink detector with adaptive per-session EAR calibration.
+
+    By default, ear_low/ear_high are NOT fixed constants -- the detector
+    watches the first `calibration_frames` detected frames of a session,
+    takes their mean EAR as the person's open-eye baseline, and derives
+    ear_low = baseline * low_ratio, ear_high = baseline * high_ratio. This
+    matters because open-eye EAR baseline varies substantially across
+    people/cameras (observed range in practice: ~0.25 up to ~0.45+), so a
+    fixed absolute threshold tuned for one person can simply never trigger
+    for another whose baseline sits well above it.
+
+    Pass explicit ear_low/ear_high to opt out of calibration and use fixed
+    absolute thresholds instead (e.g. for reproducible unit tests).
 
     Usage:
-        detector = BlinkDetector()
+        detector = BlinkDetector()  # adaptive (default)
         for frame_landmarks in stream:
             avg_ear = compute_average_ear(frame_landmarks)
             event = detector.update(avg_ear, frame_landmarks.timestamp_ms)
             if event:
                 print(f"Blink #{detector.stats.blink_count}, "
                       f"duration={event.duration_ms}ms")
+
+        # During the first calibration_frames detected frames, update()
+        # always returns None (no blinks are evaluated) while the baseline
+        # is being established -- check detector.is_calibrated if you need
+        # to know whether detection is active yet.
     """
 
     def __init__(
         self,
-        ear_low: float = EAR_LOW,
-        ear_high: float = EAR_HIGH,
+        ear_low: Optional[float] = None,
+        ear_high: Optional[float] = None,
         min_blink_duration_ms: int = MIN_BLINK_DURATION_MS,
         max_blink_duration_ms: int = MAX_BLINK_DURATION_MS,
         smoothing_window: int = EAR_SMOOTHING_WINDOW,
+        calibration_frames: int = DEFAULT_CALIBRATION_FRAMES,
+        low_ratio: float = DEFAULT_LOW_RATIO,
+        high_ratio: float = DEFAULT_HIGH_RATIO,
     ):
-        if ear_high <= ear_low:
+        if ear_low is not None and ear_high is not None and ear_high <= ear_low:
             raise ValueError("ear_high must be greater than ear_low to create a valid hysteresis band.")
+        if not (0.0 < low_ratio < high_ratio < 1.0):
+            raise ValueError("Require 0 < low_ratio < high_ratio < 1 for adaptive calibration.")
 
-        self.ear_low = ear_low
-        self.ear_high = ear_high
+        # If both fixed thresholds are given, skip calibration entirely.
+        self._use_fixed_thresholds = ear_low is not None and ear_high is not None
+        self.ear_low = ear_low if self._use_fixed_thresholds else None
+        self.ear_high = ear_high if self._use_fixed_thresholds else None
+
         self.min_blink_duration_ms = min_blink_duration_ms
         self.max_blink_duration_ms = max_blink_duration_ms
         self.smoothing_window = max(1, smoothing_window)
+
+        self.calibration_frames = calibration_frames
+        self.low_ratio = low_ratio
+        self.high_ratio = high_ratio
+        self._calibration_buffer: List[float] = []
+        self.baseline_ear: Optional[float] = None
+        self.is_calibrated = self._use_fixed_thresholds
 
         self._state = EyeState.OPEN
         self._closure_start_ms: Optional[int] = None
@@ -163,11 +211,36 @@ class BlinkDetector:
         self._session_start_ms: Optional[int] = None
         self.stats = BlinkStats()
 
+    @property
+    def is_blinking(self) -> bool:
+        """True while the eye is mid-closure (CLOSING or OPENING state)."""
+        return self._state != EyeState.OPEN
+
     def _smoothed_ear(self, raw_ear: float) -> float:
         self._ear_history.append(raw_ear)
         if len(self._ear_history) > self.smoothing_window:
             self._ear_history.pop(0)
         return sum(self._ear_history) / len(self._ear_history)
+
+    def _calibrate(self, raw_ear: float) -> bool:
+        """
+        Feed one raw EAR sample into the calibration buffer. Returns True once
+        calibration has just completed on this call (baseline + thresholds
+        newly available), False otherwise.
+        """
+        self._calibration_buffer.append(raw_ear)
+        if len(self._calibration_buffer) < self.calibration_frames:
+            return False
+
+        self.baseline_ear = float(np.mean(self._calibration_buffer))
+        self.ear_low = self.baseline_ear * self.low_ratio
+        self.ear_high = self.baseline_ear * self.high_ratio
+        self.is_calibrated = True
+        logger.info(
+            "BlinkDetector calibrated: baseline_ear=%.4f -> ear_low=%.4f, ear_high=%.4f",
+            self.baseline_ear, self.ear_low, self.ear_high,
+        )
+        return True
 
     def update(self, avg_ear: Optional[float], timestamp_ms: int) -> Optional[BlinkEvent]:
         """
@@ -183,7 +256,7 @@ class BlinkDetector:
 
         Returns:
             A BlinkEvent if a validated blink completed on this frame,
-            otherwise None.
+            otherwise None. Always None while calibration is in progress.
         """
         if self._session_start_ms is None:
             self._session_start_ms = timestamp_ms
@@ -191,6 +264,15 @@ class BlinkDetector:
         if avg_ear is None:
             # No face detected this frame — don't feed into smoothing/state,
             # just wait for the next valid frame.
+            return None
+
+        if not self.is_calibrated:
+            self._calibrate(avg_ear)
+            # Seed EAR smoothing history so detection doesn't start with an
+            # empty window the instant calibration completes.
+            self._ear_history.append(avg_ear)
+            if len(self._ear_history) > self.smoothing_window:
+                self._ear_history.pop(0)
             return None
 
         ear = self._smoothed_ear(avg_ear)
@@ -260,13 +342,27 @@ class BlinkDetector:
             self.stats.blink_rate_per_min = self.stats.blink_count / elapsed_minutes
 
     def reset(self) -> None:
-        """Reset all state and statistics (e.g. for a new session/recording)."""
+        """
+        Reset all state and statistics (e.g. for a new session/recording).
+
+        Recalibrates the EAR baseline from scratch on the new session unless
+        fixed thresholds were explicitly configured at construction time --
+        a new recording session may be a different person or a different
+        camera setup, so a stale baseline shouldn't carry over silently.
+        """
         self._state = EyeState.OPEN
         self._closure_start_ms = None
         self._min_ear_during_closure = float("inf")
         self._ear_history.clear()
         self._session_start_ms = None
         self.stats = BlinkStats()
+
+        if not self._use_fixed_thresholds:
+            self._calibration_buffer = []
+            self.baseline_ear = None
+            self.ear_low = None
+            self.ear_high = None
+            self.is_calibrated = False
 
 
 # --------------------------------------------------------------------------- #

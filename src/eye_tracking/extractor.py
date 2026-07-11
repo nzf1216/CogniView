@@ -30,8 +30,6 @@ from src.eye_tracking.landmarks import (
 from src.eye_tracking.blink import (
     BlinkDetector,
     compute_average_ear,
-    EAR_LOW,
-    EAR_HIGH,
     MIN_BLINK_DURATION_MS,
     MAX_BLINK_DURATION_MS,
 )
@@ -70,6 +68,10 @@ class EyeTrackingFeatures:
     blink_count: int
     blink_rate: float
     blink_just_occurred: bool = False
+    # False during the initial per-session EAR calibration window -- blink
+    # detection is not yet active and blink_count/blink_rate will read 0
+    # regardless of actual blinking until this flips to True.
+    blink_calibrated: bool = False
 
     # Gaze / fixation / saccade (from GazeTracker / GazeStats)
     gaze_direction: str = GazeDirection.CENTER.value
@@ -114,8 +116,14 @@ class EyeTrackingExtractor:
         min_face_detection_confidence: float = 0.5,
         min_face_presence_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
-        ear_low: float = EAR_LOW,
-        ear_high: float = EAR_HIGH,
+        # ear_low/ear_high: leave as None (default) to let BlinkDetector
+        # calibrate an adaptive EAR baseline from this session's own first
+        # frames -- open-eye EAR varies enough across people/cameras that a
+        # fixed absolute threshold silently misses blinks for people whose
+        # baseline sits far from whatever value it was tuned on. Pass both
+        # explicitly only to force fixed thresholds (e.g. reproducible tests).
+        ear_low: Optional[float] = None,
+        ear_high: Optional[float] = None,
         min_blink_duration_ms: int = MIN_BLINK_DURATION_MS,
         max_blink_duration_ms: int = MAX_BLINK_DURATION_MS,
         saccade_velocity_threshold: float = SACCADE_VELOCITY_THRESHOLD,
@@ -144,6 +152,12 @@ class EyeTrackingExtractor:
 
         self._initialized = False
         self._last_timestamp_ms: Optional[int] = None
+        # Last gaze direction computed while the eye was NOT mid-blink.
+        # Eyelid closure distorts MediaPipe's iris-center estimate, which
+        # otherwise gets misread as a spurious gaze shift (commonly UP) --
+        # so while BlinkDetector reports is_blinking, we carry the last
+        # stable direction forward instead of trusting the current frame.
+        self._last_stable_gaze_direction: str = GazeDirection.CENTER.value
 
     def initialize(self) -> None:
         """Initialize the underlying MediaPipe FaceLandmarker. Idempotent."""
@@ -194,7 +208,15 @@ class EyeTrackingExtractor:
         blink_stats = self._blink_detector.stats
         gaze_stats = self._gaze_tracker.stats
 
-        direction = gaze_sample.direction.value if gaze_sample else GazeDirection.CENTER.value
+        raw_direction = gaze_sample.direction.value if gaze_sample else GazeDirection.CENTER.value
+        if self._blink_detector.is_blinking:
+            # Mid-blink: iris position is unreliable (partially/fully
+            # occluded by the eyelid), so don't let a blink get reported as
+            # a gaze shift. Hold the last direction seen while eyes were open.
+            direction = self._last_stable_gaze_direction
+        else:
+            direction = raw_direction
+            self._last_stable_gaze_direction = direction
 
         return EyeTrackingFeatures(
             timestamp_ms=frame_landmarks.timestamp_ms,
@@ -203,6 +225,7 @@ class EyeTrackingExtractor:
             blink_count=blink_stats.blink_count,
             blink_rate=blink_stats.blink_rate_per_min,
             blink_just_occurred=blink_event is not None,
+            blink_calibrated=self._blink_detector.is_calibrated,
             gaze_direction=direction,
             fixation_stability=gaze_stats.fixation_stability,
             fixation_count=gaze_stats.fixation_count,
@@ -229,6 +252,7 @@ class EyeTrackingExtractor:
         self._blink_detector.reset()
         self._gaze_tracker.reset()
         self._last_timestamp_ms = None
+        self._last_stable_gaze_direction = GazeDirection.CENTER.value
 
     def close(self) -> None:
         """Release the underlying MediaPipe FaceLandmarker resources."""
