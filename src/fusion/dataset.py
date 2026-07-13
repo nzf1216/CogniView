@@ -93,6 +93,8 @@ class FusionDataset(Dataset):
 
         label_column: str = "label",
 
+        session_column: str = "session_id",
+
         transform=None,
 
     ):
@@ -122,6 +124,13 @@ class FusionDataset(Dataset):
         )
 
         self.label_column = label_column
+
+        # If the CSV has a session_column, _build_indices() will refuse to
+        # build any sliding window that spans two different sessions
+        # (e.g. two different concatenated trial*.csv recordings). If the
+        # column is absent, behavior is unchanged (single-session CSVs,
+        # the _demo() smoke test, etc.).
+        self.session_column = session_column
 
         logger.info(
 
@@ -158,6 +167,23 @@ class FusionDataset(Dataset):
             np.int64
 
         ).values
+
+        if self.session_column in self.data.columns:
+
+            self.session_ids = self.data[
+                self.session_column
+            ].values
+
+        else:
+
+            self.session_ids = None
+
+            logger.info(
+                "No '%s' column found — sliding windows will be built "
+                "over raw row order with no session-boundary guard. "
+                "Only safe for single-session CSVs.",
+                self.session_column,
+            )
 
         self.indices = self._build_indices()
 
@@ -238,8 +264,28 @@ class FusionDataset(Dataset):
 
             end = start + self.sequence_length
 
+            if self.session_ids is not None:
+
+                # Skip any window whose rows don't all belong to the
+                # same recording session — otherwise the tail of one
+                # trial gets stitched to the head of the next under
+                # whichever label happens to land on the last row.
+                window_sessions = self.session_ids[start:end]
+
+                if window_sessions[0] != window_sessions[-1] or not (
+                    (window_sessions == window_sessions[0]).all()
+                ):
+                    continue
+
             indices.append(
                 (start, end)
+            )
+
+        if not indices:
+            raise ValueError(
+                "No valid sequences could be built — check that "
+                "sequence_length isn't longer than every individual "
+                "session in this CSV."
             )
 
         return indices

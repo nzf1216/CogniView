@@ -188,7 +188,7 @@ val_loader = create_dataloader(
 # Model
 # ---------------------------------------------------------
 
-model = AdaptiveFusionModel()
+model = AdaptiveFusionModel(num_classes=2)
 
 model.to(DEVICE)
 
