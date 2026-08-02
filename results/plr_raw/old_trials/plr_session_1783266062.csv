@@ -1,0 +1,11 @@
+timestamp_s,stimulus_state,left_diameter_px,right_diameter_px
+0.0010,baseline,,
+1.1158,baseline,,
+2.1489,baseline,,
+3.1796,flash,,
+4.2119,recovery,,
+5.2406,recovery,,
+6.2713,recovery,,
+7.2936,recovery,,
+8.3198,recovery,,
+9.3479,recovery,,

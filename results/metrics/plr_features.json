@@ -1,0 +1,9 @@
+{
+  "baseline_diameter_px": 84.45316390976556,
+  "min_diameter_px": 83.82348090315247,
+  "time_to_min_constriction_s": 1.2389261722564697,
+  "constriction_amplitude_px": 0.6296830066130923,
+  "constriction_amplitude_pct": 0.745600256357335,
+  "constriction_latency_s": 0.04889106750488281,
+  "recovery_time_75pct_s": 0.1357710361480713
+}

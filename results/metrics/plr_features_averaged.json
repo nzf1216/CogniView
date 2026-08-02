@@ -1,0 +1,12 @@
+{
+  "n_trials": 20,
+  "features": {
+    "baseline_diameter_px": 87.39393487722072,
+    "min_diameter_px": 86.0973806949726,
+    "time_to_min_constriction_s": 1.7000000000000002,
+    "constriction_amplitude_px": 1.2965541822481157,
+    "constriction_amplitude_pct": 1.4835745570555188,
+    "constriction_latency_s": 0.25,
+    "recovery_time_75pct_s": 0.20000000000000018
+  }
+}
